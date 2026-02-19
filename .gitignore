@@ -8,6 +8,7 @@ node_modules/
 
 # Typescript files
 dist
+!generated-sdk/dist
 
 # Ruby files
 Gemfile.lock

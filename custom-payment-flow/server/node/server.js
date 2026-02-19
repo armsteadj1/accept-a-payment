@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 const {resolve} = require('path');
-// Replace if using a different env file or config
 const env = require('dotenv').config({path: './.env'});
 const calculateTax = false;
 
@@ -16,33 +15,21 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY, {
   },
 });
 
-app.use(express.static(process.env.STATIC_DIR));
-app.use(
-  express.json({
-    // We need the raw body to verify webhook signatures.
-    // Let's compute it only when hitting the Stripe webhook endpoint.
-    verify: function (req, res, buf) {
-      if (req.originalUrl.startsWith('/webhook')) {
-        req.rawBody = buf.toString();
-      }
-    },
-  })
-);
-app.use(
-  cors({
-    origin: 'http://localhost:3000',
-  })
-);
+// Initialize the generated unified payment SDK
+const { createPaymentClient } = require('unified-payment-sdk');
 
-app.get('/', (req, res) => {
-  const path = resolve(process.env.STATIC_DIR + '/index.html');
-  res.sendFile(path);
-});
-
-app.get('/config', (req, res) => {
-  res.send({
-    publishableKey: process.env.STRIPE_PUBLISHABLE_KEY,
-  });
+const paymentClient = createPaymentClient({
+  stripe: {
+    secretKey: process.env.STRIPE_SECRET_KEY,
+    apiVersion: '2023-10-16',
+    btApiKey: process.env.BT_PRIVATE_API_KEY,
+  },
+  checkout: process.env.CHECKOUT_SECRET_KEY ? {
+    secretKey: process.env.CHECKOUT_SECRET_KEY,
+    processingChannelId: process.env.CHECKOUT_PROCESSING_CHANNEL_ID || '',
+    isTest: true,
+    btApiKey: process.env.BT_PRIVATE_API_KEY,
+  } : undefined,
 });
 
 const calculate_tax = async (orderAmount, currency) => {
@@ -71,90 +58,145 @@ const calculate_tax = async (orderAmount, currency) => {
   return taxCalculation;
 };
 
+app.use(express.static(process.env.STATIC_DIR));
+app.use(
+  express.json({
+    // We need the raw body to verify webhook signatures.
+    // Let's compute it only when hitting the Stripe webhook endpoint.
+    verify: function (req, res, buf) {
+      if (req.originalUrl.startsWith('/webhook')) {
+        req.rawBody = buf.toString();
+      }
+    },
+  })
+);
+app.use(
+  cors({
+    origin: 'http://localhost:3000',
+  })
+);
+
+// Determine which processor to route to based on card details from the token
+function determineProcessor(cardDetails) {
+  if (!cardDetails) {
+    return {
+      processor: 'stripe',
+      reason: 'Default fallback - no card details available',
+      confidence: 50
+    };
+  }
+
+  const { brand, funding, segment, issuer_country } = cardDetails;
+  const countryCode = issuer_country?.alpha2 || cardDetails.issuer?.country;
+
+  if (funding && funding.toLowerCase() === 'debit') {
+    return {
+      processor: 'checkout',
+      reason: 'Debit cards route to Checkout.com for lower interchange fees',
+      confidence: 85
+    };
+  }
+
+  if (countryCode && countryCode !== 'US') {
+    return {
+      processor: 'checkout',
+      reason: 'International cards route to Checkout.com for better coverage',
+      confidence: 90
+    };
+  }
+
+  if (segment && segment.toLowerCase() === 'commercial') {
+    return {
+      processor: 'checkout',
+      reason: 'Commercial cards route to Checkout.com for B2B optimization',
+      confidence: 80
+    };
+  }
+
+  if (brand && brand.toLowerCase() === 'american express') {
+    return {
+      processor: 'stripe',
+      reason: 'American Express cards route to Stripe for better auth rates',
+      confidence: 85
+    };
+  }
+
+  // Default to Stripe for US consumer credit cards
+  return {
+    processor: 'stripe',
+    reason: 'US consumer credit cards route to Stripe (primary processor)',
+    confidence: 75
+  };
+}
+
+app.get('/', (req, res) => {
+  const path = resolve(process.env.STATIC_DIR + '/card.html');
+  res.sendFile(path);
+});
+
 app.post('/create-payment-intent', async (req, res) => {
-  const { paymentMethodType, currency, paymentMethodOptions } = req.body;
-
-  // Each payment method type has support for different currencies. In order to
-  // support many payment method types and several currencies, this server
-  // endpoint accepts both the payment method type and the currency as
-  // parameters. To get compatible payment method types, pass 
-  // `automatic_payment_methods[enabled]=true` and enable types in your dashboard 
-  // at https://dashboard.stripe.com/settings/payment_methods.
-  //
-  // Some example payment method types include `card`, `ideal`, and `link`.
-  let orderAmount = 5999;
-  let params = {};
-
-  if (calculateTax) {
-    let taxCalculation = await calculate_tax(orderAmount, currency)
-    params = {
-      payment_method_types: paymentMethodType === 'link' ? ['link', 'card'] : [paymentMethodType],
-      amount: taxCalculation.amount_total,
-      currency: currency,
-      metadata: { tax_calculation: taxCalculation.id }
-    }
-  }
-  else {
-    params = {
-      payment_method_types: paymentMethodType === 'link' ? ['link', 'card'] : [paymentMethodType],
-      amount: orderAmount,
-      currency: currency,
-    }
-  }
-  // If this is for an ACSS payment, we add payment_method_options to create
-  // the Mandate.
-  if (paymentMethodType === 'acss_debit') {
-    params.payment_method_options = {
-      acss_debit: {
-        mandate_options: {
-          payment_schedule: 'sporadic',
-          transaction_type: 'personal',
-        },
-      },
-    }
-  } else if (paymentMethodType === 'konbini') {
-    /**
-     * Default value of the payment_method_options
-     */
-    params.payment_method_options = {
-      konbini: {
-        product_description: 'Tシャツ',
-        expires_after_days: 3,
-      },
-    }
-  } else if (paymentMethodType === 'customer_balance') {
-    params.payment_method_data = {
-      type: 'customer_balance',
-    }
-    params.confirm = true
-    params.customer = req.body.customerId || await stripe.customers.create().then(data => data.id)
-  }
-
-  /**
-   * If API given this data, we can overwride it
-   */
-  if (paymentMethodOptions) {
-    params.payment_method_options = paymentMethodOptions
-  }
-
-  // Create a PaymentIntent with the amount, currency, and a payment method type.
-  //
-  // See the documentation [0] for the full list of supported parameters.
-  //
-  // [0] https://stripe.com/docs/api/payment_intents/create
   try {
-    const paymentIntent = await stripe.paymentIntents.create(params);
+    const { tokenId, amount, currency, customerName, cardDetails } = req.body;
 
-    // Send publishable key and PaymentIntent details to client
-    res.send({
-      clientSecret: paymentIntent.client_secret,
-      nextAction: paymentIntent.next_action,
-    });
-  } catch (e) {
-    return res.status(400).send({
-      error: {
-        message: e.message,
+    console.log('Processing payment:', { tokenId, amount, currency, customerName });
+
+    // Step 1: Route based on card details returned on the token
+    const routingDecision = determineProcessor(cardDetails);
+    console.log('Routing decision:', routingDecision);
+
+    // Step 2: Build the SDK transaction request
+    const transactionRequest = {
+      amount: {
+        value: amount,
+        currency: currency,
       },
+      source: {
+        type: 'basis_theory_token',
+        id: tokenId,
+        holderName: customerName,
+      },
+      reference: 'order-' + Date.now(),
+      metadata: {
+        routedProcessor: routingDecision.processor,
+        routingReason: routingDecision.reason,
+      },
+    };
+
+    // Step 3: Authorize via the generated SDK
+    const result = await paymentClient.authorize(
+      routingDecision.processor,
+      transactionRequest
+    );
+
+    console.log('Payment result:', result);
+
+    // Step 4: Return unified response
+    const response = {
+      success: result.status.code === 'authorized',
+      transactionId: result.id,
+      status: result.status.code,
+      processor: routingDecision.processor,
+      routingDecision: routingDecision,
+      cardDetails: cardDetails,
+      result: result,
+    };
+
+    res.send(response);
+
+  } catch (error) {
+    console.error('Payment processing error:', error);
+
+    // TransactionError from the SDK includes structured error info
+    if (error.response) {
+      return res.status(400).send({
+        error: { message: error.message },
+        errorCodes: error.response.errorCodes,
+        providerErrors: error.response.providerErrors,
+      });
+    }
+
+    res.status(500).send({
+      error: { message: error.message }
     });
   }
 });

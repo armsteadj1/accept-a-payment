@@ -1,0 +1,48 @@
+{
+  "name": "unified-payment-sdk",
+  "version": "1.0.0",
+  "description": "Generated TypeScript SDK for unified payment processing across multiple PSPs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/**/*"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "keywords": [
+    "payments",
+    "stripe",
+    "checkout",
+    "basis-theory",
+    "psp",
+    "payment-processing",
+    "typescript",
+    "sdk"
+  ],
+  "author": "Generated SDK",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {},
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thegreysky/accept-a-payment.git",
+    "directory": "generated-sdk"
+  },
+  "bugs": {
+    "url": "https://github.com/thegreysky/accept-a-payment/issues"
+  },
+  "homepage": "https://github.com/thegreysky/accept-a-payment#readme"
+}
